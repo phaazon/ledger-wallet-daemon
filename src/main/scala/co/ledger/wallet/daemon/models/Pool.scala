@@ -7,7 +7,7 @@ import co.ledger.wallet.daemon.async.MDCPropagatingExecutionContext.Implicits.gl
 import co.ledger.wallet.daemon.clients.ClientFactory
 import co.ledger.wallet.daemon.configurations.DaemonConfiguration
 import co.ledger.wallet.daemon.database.PoolDto
-import co.ledger.wallet.daemon.exceptions.{CurrencyNotFoundException, WalletNotFoundException}
+import co.ledger.wallet.daemon.exceptions.{CoreDatabaseException, CurrencyNotFoundException, WalletNotFoundException}
 import co.ledger.wallet.daemon.libledger_core.async.LedgerCoreExecutionContext
 import co.ledger.wallet.daemon.libledger_core.crypto.SecureRandomRNG
 import co.ledger.wallet.daemon.libledger_core.debug.NoOpLogPrinter
@@ -24,7 +24,7 @@ import org.bitcoinj.core.Sha256Hash
 import scala.collection.JavaConverters._
 import scala.collection._
 import scala.concurrent.Future
-import scala.util.Try
+import scala.util.{Failure, Success, Try}
 
 class Pool(private val coreP: core.WalletPool, val id: Long) extends Logging {
   private[this] val self = this
@@ -272,11 +272,28 @@ object Pool {
   def newCoreInstance(poolDto: PoolDto): Future[core.WalletPool] = {
     val poolConfig = core.DynamicObject.newInstance()
     val dbBackend = Try(config.getString("core_database_engine")).toOption.getOrElse("sqlite3") match {
-      case "postgres" => {
-        poolConfig.putString("DATABASE_NAME", s"${config.getString("postgres.url")}/${poolDto.name}")
-        poolConfig.putBoolean("USE_PG_DATABASE", true)
-        core.DatabaseBackend.getPostgreSQLBackend(config.getInt("postgres.pool_size"))
-      }
+      case "postgres" =>
+        val dbName = for {
+          dbPort <- Try(config.getString("postgres.port"))
+          dbHost <- Try(config.getString("postgres.host"))
+          dbUserName <- Try(config.getString("postgres.username"))
+          dbPwd <- Try(config.getString("postgres.password"))
+          dbPrefix <- Try(config.getString("postgres.db_name_prefix"))
+        } yield {
+          // Ref: postgres://USERNAME:PASSWORD@HOST:PORT/DBNAME
+          if (dbPwd.isEmpty) {
+            s"postgres://${dbUserName}:${dbPwd}@${dbHost}:${dbPort}/${dbPrefix}${poolDto.name}"
+          } else {
+            s"postgres://${dbUserName}@${dbHost}:${dbPort}/${dbPrefix}${poolDto.name}"
+          }
+        }
+        dbName match {
+          case Success(value) =>
+            poolConfig.putString("DATABASE_NAME", value)
+            core.DatabaseBackend.getPostgreSQLBackend(config.getInt("postgres.pool_size"))
+          case Failure(exception) =>
+            throw CoreDatabaseException("Failed to configure wallet daemon's core database", exception)
+        }
       case _ => core.DatabaseBackend.getSqlite3Backend
     }
 
